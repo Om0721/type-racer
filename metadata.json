@@ -1,0 +1,6 @@
+{
+  "name": "Type Racer",
+  "description": "A high-octane multiplayer typing racing game with real-time competition, bot challenges, and professional racing HUD.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

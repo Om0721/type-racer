@@ -1,0 +1,52 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "Stores user statistics, leveling, and currency info.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Firebase Auth UID" },
+        "username": { "type": "string", "minLength": 3, "maxLength": 20 },
+        "bestWpm": { "type": "number" },
+        "avgAccuracy": { "type": "number" },
+        "coins": { "type": "number" },
+        "xp": { "type": "number" },
+        "level": { "type": "number" },
+        "matchesPlayed": { "type": "number" },
+        "wins": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "username"]
+    },
+    "RaceResult": {
+      "title": "Race Result",
+      "description": "Historical record of a completed race.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "wpm": { "type": "number" },
+        "accuracy": { "type": "number" },
+        "position": { "type": "number" },
+        "time": { "type": "number" },
+        "xpEarned": { "type": "number" },
+        "coinsEarned": { "type": "number" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "wpm", "accuracy"]
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": "UserProfile",
+      "description": "User profile document"
+    },
+    "/users/{uid}/history/{raceId}": {
+      "schema": "RaceResult",
+      "description": "User race history"
+    },
+    "/leaderboard/{uid}": {
+      "schema": "UserProfile",
+      "description": "Public leaderboard data"
+    }
+  }
+}
