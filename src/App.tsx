@@ -1703,7 +1703,7 @@ const DashboardView = ({
       className="relative z-10 p-4 md:p-6 pt-4 max-w-7xl mx-auto space-y-6"
     >
       {/* Sleek Horizontal Header / Navbar */}
-      <div className={`p-4 md:p-5 rounded-[2rem] border transition-all backdrop-blur-xl relative overflow-visible shadow-lg ${
+      <div className={`p-4 md:p-5 rounded-[2rem] border transition-all backdrop-blur-xl relative z-30 overflow-visible shadow-lg ${
         theme === 'dark' ? 'bg-white/5 border-white/10' : 'bg-white border-gray-150 shadow-sm'
       }`}>
         <div className="flex flex-row items-center justify-between gap-4 relative z-10">
@@ -2112,7 +2112,7 @@ const LobbyView = ({ room, isHost, onStart, onBack }: any) => {
         </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mb-12">
-        {room.players.map((player) => (
+        {room.players.map((player: any) => (
           <div key={player.id} className="flex items-center gap-4 bg-black/40 border border-white/5 p-6 rounded-2xl">
             <AvatarDisplay avatarId={player.avatar} size="md" />
             <div className="flex-1 min-w-0">
