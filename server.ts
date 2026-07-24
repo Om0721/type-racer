@@ -720,8 +720,13 @@ io.on('connection', (socket) => {
       return;
     }
 
+    const pId = userId || socket.id;
+
+    // Check if player is already in the room to prevent duplicates
+    const existingIndex = room.players.findIndex(p => p.id === pId);
+
     const player: PlayerProgress = {
-      id: userId || socket.id,
+      id: pId,
       username,
       avatar: avatar || 'avatar_boy_1',
       wpm: 0,
@@ -732,35 +737,82 @@ io.on('connection', (socket) => {
       carId: `car-${Math.floor(Math.random() * 5) + 1}`
     };
 
-    room.players.push(player);
-    socket.data.userId = userId;
+    // Store socketId on player object dynamically
+    (player as any).socketId = socket.id;
+
+    if (existingIndex !== -1) {
+      room.players[existingIndex] = {
+        ...room.players[existingIndex],
+        ...player,
+        // Preserve readiness if they are reconnecting/joining again
+        isReady: room.players[existingIndex].isReady
+      };
+    } else {
+      room.players.push(player);
+    }
+
+    socket.data.userId = pId;
+    socket.data.roomId = roomId;
     socket.join(roomId);
     io.to(roomId).emit('roomUpdate', room);
   });
 
   socket.on('createRoom', ({ username, userId, avatar }) => {
     const roomId = generateRoomCode();
+    const pId = userId || socket.id;
+    const player: PlayerProgress = {
+      id: pId,
+      username,
+      avatar: avatar || 'avatar_boy_1',
+      wpm: 0,
+      accuracy: 0,
+      progress: 0,
+      isReady: true,
+      isFinished: false,
+      carId: 'car-1'
+    };
+    (player as any).socketId = socket.id;
+
     const room: Room = {
       id: roomId,
-      hostId: userId || socket.id,
-      players: [{
-        id: userId || socket.id,
-        username,
-        avatar: avatar || 'avatar_boy_1',
-        wpm: 0,
-        accuracy: 0,
-        progress: 0,
-        isReady: true,
-        isFinished: false,
-        carId: 'car-1'
-      }],
+      hostId: pId,
+      players: [player],
       status: 'waiting',
       text: RACE_TEXTS[Math.floor(Math.random() * RACE_TEXTS.length)]
     };
     rooms.set(roomId, room);
-    socket.data.userId = userId;
+    socket.data.userId = pId;
+    socket.data.roomId = roomId;
     socket.join(roomId);
     socket.emit('roomCreated', room);
+  });
+
+  socket.on('leaveRoom', ({ roomId, userId }) => {
+    const room = rooms.get(roomId);
+    if (room) {
+      const pId = userId || socket.data.userId || socket.id;
+      const index = room.players.findIndex(p => p.id === pId || (p as any).socketId === socket.id);
+      if (index !== -1) {
+        room.players.splice(index, 1);
+        socket.leave(roomId);
+        if (room.players.length === 0) {
+          // Cancel any scheduled game timeout or countdown
+          if ((room as any).timeoutId) {
+            clearTimeout((room as any).timeoutId);
+          }
+          if ((room as any).countdownIntervalId) {
+            clearInterval((room as any).countdownIntervalId);
+          }
+          rooms.delete(roomId);
+        } else {
+          // If the host left, assign the first remaining player as the host
+          if (room.hostId === pId) {
+            room.hostId = room.players[0].id;
+          }
+          io.to(roomId).emit('roomUpdate', room);
+        }
+      }
+    }
   });
 
   socket.on('updateProgress', ({ roomId, progress, wpm, accuracy, heatmap }) => {
@@ -779,17 +831,26 @@ io.on('connection', (socket) => {
           const othersFinished = room.players.filter(p => p.id !== player.id && p.isFinished).length;
           const won = othersFinished === 0;
 
-          // In multiplayer, if one player finishes, end the race for everyone
+          // In multiplayer, if any one player completes the race, end it for everyone immediately
           if (room.id !== 'BOT-RACE' && room.id !== 'PRACTICE') {
             room.status = 'finished';
-            // Mark all players as finished and update stats for those not yet updated
+            
+            // Cancel the room's 60-second limit timeout
+            if ((room as any).timeoutId) {
+              clearTimeout((room as any).timeoutId);
+            }
+
+            // Mark all other players as finished too and update their stats
             room.players.forEach(p => {
               if (!p.isFinished) {
                 p.isFinished = true;
                 p.finishTime = Date.now();
                 if (p.id && !p.id.startsWith('bot-') && p.id !== player.id) {
                   updateStats(p.id, p.wpm, p.accuracy, false, 'multiplayer').then(res => {
-                    if (res) p.rewards = res.rewards;
+                    if (res) {
+                      p.rewards = res.rewards;
+                      io.to(roomId).emit('roomUpdate', room);
+                    }
                   });
                 }
               }
@@ -824,24 +885,72 @@ io.on('connection', (socket) => {
         io.to(roomId).emit('countdown', countdown);
         if (countdown === 0) {
           clearInterval(interval);
+          if ((room as any).countdownIntervalId) {
+            delete (room as any).countdownIntervalId;
+          }
           room.status = 'racing';
           room.startTime = Date.now();
           io.to(roomId).emit('roomUpdate', room);
+
+          // Setup server-side timeout of 60 seconds to end the race if nobody completes it in time
+          if (room.id !== 'BOT-RACE' && room.id !== 'PRACTICE') {
+            const roomTimeoutId = setTimeout(() => {
+              const currentRoom = rooms.get(roomId);
+              if (currentRoom && currentRoom.status === 'racing') {
+                currentRoom.status = 'finished';
+                
+                // Mark all players as finished and update their stats
+                let pendingUpdates = 0;
+                currentRoom.players.forEach(p => {
+                  if (!p.isFinished) {
+                    p.isFinished = true;
+                    p.finishTime = Date.now();
+                    if (p.id && !p.id.startsWith('bot-')) {
+                      pendingUpdates++;
+                      updateStats(p.id, p.wpm, p.accuracy, false, 'multiplayer').then(res => {
+                        if (res) p.rewards = res.rewards;
+                        pendingUpdates--;
+                        if (pendingUpdates === 0) {
+                          io.to(roomId).emit('roomUpdate', currentRoom);
+                        }
+                      });
+                    }
+                  }
+                });
+                
+                io.to(roomId).emit('roomUpdate', currentRoom);
+              }
+            }, 60000); // 60 seconds limit
+            
+            (room as any).timeoutId = roomTimeoutId;
+          }
         }
         countdown--;
       }, 1000);
+      (room as any).countdownIntervalId = interval;
     }
   });
 
   socket.on('disconnect', () => {
     // Handle player removal from rooms
     rooms.forEach((room, roomId) => {
-      const index = room.players.findIndex(p => p.id === socket.id);
+      const index = room.players.findIndex(p => p.id === socket.data.userId || (p as any).socketId === socket.id || p.id === socket.id);
       if (index !== -1) {
         room.players.splice(index, 1);
         if (room.players.length === 0) {
+          // Cancel scheduled timeout or countdown
+          if ((room as any).timeoutId) {
+            clearTimeout((room as any).timeoutId);
+          }
+          if ((room as any).countdownIntervalId) {
+            clearInterval((room as any).countdownIntervalId);
+          }
           rooms.delete(roomId);
         } else {
+          // If the host left, assign the first remaining player as the host
+          if (room.hostId === socket.data.userId || room.hostId === socket.id) {
+            room.hostId = room.players[0].id;
+          }
           io.to(roomId).emit('roomUpdate', room);
         }
       }

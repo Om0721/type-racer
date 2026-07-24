@@ -32,6 +32,22 @@ import { AvatarDisplay } from './components/AvatarDisplay';
 // Main Application State
 const SUPPORT_WHATSAPP_NUMBER = "7040381416";
 
+const playAudioBeep = (freq: number, type: OscillatorType = 'sine', duration: number = 0.1) => {
+  try {
+    const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+    gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+  } catch (e) {}
+};
+
 export default function App() {
   const [view, setView] = useState<'landing' | 'login' | 'register' | 'dashboard' | 'race' | 'lobby' | 'history' | 'guide'>('landing');
   const [user, setUser] = useState<UserType | null>(null);
@@ -128,7 +144,7 @@ export default function App() {
     }
   }, [view, user]);
 
-  const fetchProfile = async (token: string) => {
+  const fetchProfile = useCallback(async (token: string) => {
     if (!token || token === 'null' || token === 'undefined') {
       localStorage.removeItem('type-racer-token');
       return;
@@ -146,7 +162,9 @@ export default function App() {
         const data = await res.json();
         if (data && data.id) {
           setUser(data);
-          setView('dashboard');
+          if (viewRef.current === 'landing') {
+            setView('dashboard');
+          }
         } else {
           handleLogout();
         }
@@ -158,7 +176,29 @@ export default function App() {
       console.error('Network error fetching profile:', err.message || err);
       setError('Connection to server failed. Please check your internet or try again.');
     }
-  };
+  }, [handleLogout]);
+
+  // Refs to avoid stale closures in socket events
+  const userRef = React.useRef(user);
+  const lastRewardsRef = React.useRef(lastRewards);
+  const showScoreCardRef = React.useRef(showScoreCard);
+  const viewRef = React.useRef(view);
+
+  useEffect(() => {
+    userRef.current = user;
+  }, [user]);
+
+  useEffect(() => {
+    lastRewardsRef.current = lastRewards;
+  }, [lastRewards]);
+
+  useEffect(() => {
+    showScoreCardRef.current = showScoreCard;
+  }, [showScoreCard]);
+
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
 
   // Socket Listeners
   useEffect(() => {
@@ -170,17 +210,34 @@ export default function App() {
 
     socket.on('roomUpdate', (updatedRoom) => {
       setRoom(updatedRoom);
-      if (updatedRoom.status === 'starting' || updatedRoom.status === 'racing') {
-        setView('race');
+      setRaceText(updatedRoom.text); // Always sync race text
+
+      const currentView = viewRef.current;
+
+      if (updatedRoom.status === 'waiting') {
+        if (currentView === 'dashboard' || currentView === 'landing' || currentView === 'lobby') {
+          setView('lobby');
+        }
       }
 
-      if (updatedRoom.status === 'finished' && !showScoreCard) {
+      if (updatedRoom.status === 'starting' || updatedRoom.status === 'racing') {
+        if (currentView !== 'race') {
+          // Reset stats upon entering a new race to clear previous stats
+          setStats({ wpm: 0, accuracy: 100, combo: 0, nitro: 0, timer: 0, rank: 1, heatmap: {} });
+          setView('race');
+        }
+        if (updatedRoom.status === 'racing') {
+          setCountdown(null);
+        }
+      }
+
+      if (updatedRoom.status === 'finished' && !showScoreCardRef.current) {
         setShowScoreCard(true);
       }
       
       // Update rewards and profile if user finished in multiplayer
-      const me = updatedRoom.players.find((p: any) => p.id === (user?.id || socket.id));
-      if (me && me.isFinished && me.rewards && lastRewards.points === 0) {
+      const me = updatedRoom.players.find((p: any) => p.id === (userRef.current?.id || socket.id));
+      if (me && me.isFinished && me.rewards && lastRewardsRef.current.points === 0) {
         setLastRewards(me.rewards);
         const token = localStorage.getItem('type-racer-token');
         if (token) fetchProfile(token);
@@ -189,6 +246,12 @@ export default function App() {
 
     socket.on('countdown', (count) => {
       setCountdown(count);
+      if (count > 0) {
+        playAudioBeep(440, 'sine', 0.15);
+      } else if (count === 0) {
+        playAudioBeep(880, 'square', 0.3);
+        setCountdown(null);
+      }
     });
 
     return () => {
@@ -196,7 +259,7 @@ export default function App() {
       socket.off('roomUpdate');
       socket.off('countdown');
     };
-  }, []);
+  }, [fetchProfile]);
 
   // Game Loop for Timer
   useEffect(() => {
@@ -207,7 +270,7 @@ export default function App() {
           setPracticeTimeLeft(prev => {
             if (prev <= 0.1) {
               clearInterval(interval);
-              setShowScoreCard(true);
+              setTimeout(() => setShowScoreCard(true), 0);
               return 0;
             }
             return prev - 0.1;
@@ -218,7 +281,7 @@ export default function App() {
           const nextTimer = prev.timer + 100;
           if (nextTimer >= 60000 && !showScoreCard) {
             clearInterval(interval);
-            setShowScoreCard(true);
+            setTimeout(() => setShowScoreCard(true), 0);
             return { ...prev, timer: 60000 };
           }
           return { ...prev, timer: nextTimer };
@@ -415,6 +478,17 @@ export default function App() {
     }
   };
 
+  // Declaratively submit stats when a local race finishes (Practice Mode or Bot Race)
+  useEffect(() => {
+    if ((isBotRace || isPracticeMode) && room && room.status === 'finished' && !hasSubmittedRaceStatsRef.current) {
+      const userPlayer = room.players.find(p => p.id === (user?.id || 'local'));
+      if (userPlayer) {
+        const won = isPracticeMode ? true : (room.players.filter(p => p.isFinished).length === 1 && room.players[0].id === (user?.id || 'local'));
+        submitStats(userPlayer.wpm, userPlayer.accuracy, won, stats.heatmap);
+      }
+    }
+  }, [isBotRace, isPracticeMode, room?.status, user?.id, stats.heatmap]);
+
   const fetchHistory = async () => {
     const token = localStorage.getItem('type-racer-token');
     if (!token) return;
@@ -433,7 +507,18 @@ export default function App() {
     }
   };
 
+  const handleLeaveRoom = () => {
+    if (room && room.id !== 'BOT-RACE' && room.id !== 'PRACTICE') {
+      socket.emit('leaveRoom', { roomId: room.id, userId: user?.id });
+    }
+    setView('dashboard');
+    setRoom(null);
+  };
+
   const handleCloseScoreCard = useCallback(() => {
+    if (room && room.id !== 'BOT-RACE' && room.id !== 'PRACTICE') {
+      socket.emit('leaveRoom', { roomId: room.id, userId: user?.id });
+    }
     setShowScoreCard(false);
     setView('dashboard');
     setRoom(null);
@@ -442,10 +527,30 @@ export default function App() {
     setStats({ wpm: 0, accuracy: 100, combo: 0, nitro: 0, timer: 0, rank: 1, heatmap: {} });
     const token = localStorage.getItem('type-racer-token');
     if (token) fetchProfile(token);
-  }, [fetchProfile]);
+  }, [fetchProfile, room, user]);
 
   const handleProgress = (progress: number, wpm: number, accuracy: number, heatmap?: any) => {
     if (room && room.status === 'racing' && !showScoreCard) {
+      if (progress >= 1) {
+        // Play Finish Sound safely outside state updaters
+        try {
+          const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.type = 'triangle';
+          osc.frequency.setValueAtTime(523.25, audioCtx.currentTime); // C5
+          osc.frequency.exponentialRampToValueAtTime(1046.50, audioCtx.currentTime + 0.4); // C6
+          gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.4);
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.start();
+          osc.stop(audioCtx.currentTime + 0.4);
+        } catch (e) {}
+
+        setTimeout(() => setShowScoreCard(true), 0);
+      }
+
       if (isBotRace || isPracticeMode) {
         setRoom(prev => {
           if (!prev) return null;
@@ -456,27 +561,11 @@ export default function App() {
             if (progress >= 1 && !newPlayers[userIdx].isFinished) {
               newPlayers[userIdx] = { ...newPlayers[userIdx], isFinished: true, finishTime: Date.now() };
               
-              // Finish Sound
-              try {
-                const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-                const osc = audioCtx.createOscillator();
-                const gain = audioCtx.createGain();
-                osc.type = 'triangle';
-                osc.frequency.setValueAtTime(523.25, audioCtx.currentTime); // C5
-                osc.frequency.exponentialRampToValueAtTime(1046.50, audioCtx.currentTime + 0.4); // C6
-                gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
-                gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.4);
-                osc.connect(gain);
-                gain.connect(audioCtx.destination);
-                osc.start();
-                osc.stop(audioCtx.currentTime + 0.4);
-              } catch (e) {}
-
-              // Submit Stats
-              const won = isPracticeMode ? true : (newPlayers.filter(p => p.isFinished).length === 1);
-              submitStats(wpm, accuracy, won, heatmap);
-              setShowScoreCard(true);
-              return { ...prev, status: 'finished', players: newPlayers };
+              // Only check if both/all are finished to set status to finished
+              const allFinished = isPracticeMode ? true : newPlayers.every(p => p.isFinished);
+              if (allFinished) {
+                return { ...prev, status: 'finished', players: newPlayers };
+              }
             }
           }
           return { ...prev, players: newPlayers };
@@ -497,10 +586,6 @@ export default function App() {
         
         // Calculate Rank locally for smoothness
         const rank = (room.players.filter(p => p.progress > progress).length) + 1;
-        
-        if (progress >= 1 && !showScoreCard) {
-          setShowScoreCard(true);
-        }
 
         return { ...prev, wpm, accuracy, combo: newCombo, nitro: newNitro, rank, heatmap: heatmap || prev.heatmap };
       });
@@ -636,12 +721,7 @@ export default function App() {
                 clearInterval(interval);
 
                 // Bot reached 100% progress first -> End race immediately!
-                const userIdx = newPlayers.findIndex(p => p.id !== 'bot-1');
-                if (userIdx !== -1) {
-                  const player = newPlayers[userIdx];
-                  submitStats(player.wpm, player.accuracy, false);
-                }
-                setShowScoreCard(true);
+                setTimeout(() => setShowScoreCard(true), 0);
                 return { ...prev, status: 'finished', players: newPlayers };
               }
             }
@@ -771,7 +851,7 @@ export default function App() {
               room={room} 
               isHost={room.hostId === user?.id} 
               onStart={handleStartRace} 
-              onBack={() => setView('dashboard')}
+              onBack={handleLeaveRoom}
               theme={theme}
             />
           )}
@@ -1240,107 +1320,116 @@ const LandingView = ({ onStart, onPractice, theme }: any) => (
     initial={{ opacity: 0 }} 
     animate={{ opacity: 1 }} 
     exit={{ opacity: 0 }}
-    className="relative z-10 min-h-screen flex flex-col items-center justify-between p-6 text-center overflow-hidden"
+    className="relative w-full min-h-screen flex flex-col items-center overflow-y-auto overflow-x-hidden"
   >
-    {/* Animated Background Racing Accents */}
-    <div className="absolute inset-0 pointer-events-none overflow-hidden">
-      <motion.div 
-        animate={{ scale: [1, 1.25, 1], opacity: [0.15, 0.25, 0.15] }}
-        transition={{ duration: 10, repeat: Infinity, ease: 'easeInOut' }}
-        className="absolute -top-32 left-1/2 -translate-x-1/2 w-[800px] h-[500px] bg-gradient-to-b from-blue-600/30 to-purple-600/10 blur-[140px] rounded-full"
-      />
-      <motion.div 
-        animate={{ opacity: [0.1, 0.3, 0.1], y: [0, -30, 0] }}
-        transition={{ duration: 6, repeat: Infinity, ease: 'easeInOut' }}
-        className="absolute bottom-10 right-10 w-[450px] h-[450px] bg-blue-500/10 blur-[120px] rounded-full"
-      />
-      <div className="absolute inset-0 opacity-10 bg-[radial-gradient(#3b82f6_1px,transparent_1px)] [background-size:24px_24px]" />
-    </div>
-
-    {/* Brand Header */}
-    <motion.div 
-      initial={{ y: -20, opacity: 0 }}
-      animate={{ y: 0, opacity: 1 }}
-      className="w-full max-w-7xl flex items-center justify-between py-6 relative z-20"
-    >
-      <div className="flex items-center gap-3 group cursor-pointer">
-        <div className="w-11 h-11 rounded-2xl bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center shadow-lg shadow-blue-500/20 group-hover:rotate-12 transition-transform">
-          <Zap className="w-6 h-6 text-white fill-white" />
-        </div>
-        <div className="text-left">
-          <span className="text-2xl font-black italic tracking-tighter uppercase block leading-none">Type Racer</span>
-          <span className="text-[9px] font-black uppercase tracking-[0.2em] text-blue-400">Pro Arena</span>
-        </div>
+    {/* First Viewport: Hero Section */}
+    <div className="w-full min-h-screen flex flex-col items-center justify-between px-6 pb-6 relative shrink-0">
+      {/* Animated Background Racing Accents */}
+      <div className="absolute inset-0 pointer-events-none overflow-hidden">
+        <motion.div 
+          animate={{ scale: [1, 1.25, 1], opacity: [0.15, 0.25, 0.15] }}
+          transition={{ duration: 10, repeat: Infinity, ease: 'easeInOut' }}
+          className="absolute -top-32 left-1/2 -translate-x-1/2 w-[800px] h-[500px] bg-gradient-to-b from-blue-600/30 to-purple-600/10 blur-[140px] rounded-full"
+        />
+        <motion.div 
+          animate={{ opacity: [0.1, 0.3, 0.1], y: [0, -30, 0] }}
+          transition={{ duration: 6, repeat: Infinity, ease: 'easeInOut' }}
+          className="absolute bottom-10 right-10 w-[450px] h-[450px] bg-blue-500/10 blur-[120px] rounded-full"
+        />
+        <div className="absolute inset-0 opacity-10 bg-[radial-gradient(#3b82f6_1px,transparent_1px)] [background-size:24px_24px]" />
       </div>
 
-      <div className="flex items-center gap-4">
-        <button 
-          onClick={onStart}
-          className="text-xs font-black uppercase tracking-wider text-white/70 hover:text-white px-4 py-2 rounded-xl transition-colors"
-        >
-          Sign In
-        </button>
-        <motion.button 
-          whileHover={{ scale: 1.05 }}
-          whileTap={{ scale: 0.95 }}
-          onClick={onPractice}
-          className="bg-blue-600 hover:bg-blue-700 text-white px-5 py-2.5 rounded-xl font-black italic text-xs uppercase tracking-wider shadow-lg shadow-blue-600/30 transition-all"
-        >
-          Create Account
-        </motion.button>
-      </div>
-    </motion.div>
-
-    {/* Hero Main Content */}
-    <motion.div
-      initial={{ y: 30, opacity: 0 }}
-      animate={{ y: 0, opacity: 1 }}
-      transition={{ delay: 0.2, duration: 0.8 }}
-      className="max-w-5xl my-auto py-12 relative z-20 flex flex-col items-center"
-    >
+      {/* Brand Header */}
       <motion.div 
-        initial={{ scale: 0.9, opacity: 0 }}
-        animate={{ scale: 1, opacity: 1 }}
-        transition={{ delay: 0.3 }}
-        className="inline-flex items-center gap-2 px-4 py-2 rounded-full border border-blue-500/30 bg-blue-500/10 text-blue-400 text-xs font-black uppercase tracking-widest mb-8 backdrop-blur-md"
+        initial={{ y: -20, opacity: 0 }}
+        animate={{ y: 0, opacity: 1 }}
+        className="w-full max-w-7xl flex items-center justify-between py-4 relative z-20"
       >
-        <Flame className="w-4 h-4 animate-pulse text-orange-400" />
-        <span>World's #1 Competitive Typing Circuit</span>
+        <div className="flex items-center gap-3 group cursor-pointer">
+          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center shadow-lg shadow-blue-500/20 group-hover:rotate-12 transition-transform">
+            <Zap className="w-5 h-5 text-white fill-white" />
+          </div>
+          <div className="text-left">
+            <span className="text-xl font-black italic tracking-tighter uppercase block leading-none">Type Racer</span>
+            <span className="text-[8px] font-black uppercase tracking-[0.2em] text-blue-400">Pro Arena</span>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <button 
+            onClick={onStart}
+            className="text-xs font-black uppercase tracking-wider text-white/70 hover:text-white px-3 py-2 rounded-lg transition-colors"
+          >
+            Sign In
+          </button>
+          <motion.button 
+            whileHover={{ scale: 1.05 }}
+            whileTap={{ scale: 0.95 }}
+            onClick={onPractice}
+            className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-xl font-black italic text-[11px] uppercase tracking-wider shadow-lg shadow-blue-600/30 transition-all"
+          >
+            Create Account
+          </motion.button>
+        </div>
       </motion.div>
 
-      <h1 className="text-6xl sm:text-7xl md:text-[8.5rem] font-black italic tracking-tighter leading-[0.85] mb-8 uppercase drop-shadow-2xl">
-        <span className="block text-white">Speed.</span>
-        <span className="block bg-gradient-to-r from-blue-400 via-blue-500 to-indigo-400 bg-clip-text text-transparent">Precision.</span>
-        <span className="block text-white">Glory.</span>
-      </h1>
-      
-      <p className={`text-base sm:text-lg md:text-xl font-bold mb-10 max-w-2xl mx-auto leading-relaxed ${theme === 'dark' ? 'text-white/60' : 'text-gray-600'}`}>
-        Dominate the racetrack with millisecond accuracy. Race real opponents globally in zero-latency private rooms or challenge adaptive AI bots.
-      </p>
-      
-      <div className="flex flex-col sm:flex-row gap-5 justify-center w-full max-w-md">
-        <motion.button 
-          whileHover={{ scale: 1.04, y: -2 }}
-          whileTap={{ scale: 0.96 }}
-          onClick={onStart}
-          className="bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-500 hover:to-blue-600 text-white px-10 py-5 rounded-2xl font-black italic text-xl flex items-center justify-center gap-3 transition-all shadow-[0_15px_40px_rgba(37,99,235,0.4)] border border-blue-400/30"
+      {/* Hero Main Content */}
+      <motion.div
+        initial={{ y: 20, opacity: 0 }}
+        animate={{ y: 0, opacity: 1 }}
+        transition={{ delay: 0.2, duration: 0.6 }}
+        className="max-w-4xl my-auto py-2 relative z-20 flex flex-col items-center"
+      >
+        <motion.div 
+          initial={{ scale: 0.9, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          transition={{ delay: 0.3 }}
+          className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full border border-blue-500/30 bg-blue-500/10 text-blue-400 text-[10px] font-black uppercase tracking-widest mb-4 sm:mb-6 backdrop-blur-md"
         >
-          <span>ENTER THE TRACK</span>
-          <ChevronRight className="w-6 h-6" />
-        </motion.button>
-        <motion.button 
-          whileHover={{ scale: 1.04, backgroundColor: theme === 'dark' ? 'rgba(255,255,255,0.1)' : 'rgba(243,244,246,1)' }}
-          whileTap={{ scale: 0.96 }}
-          onClick={onPractice}
-          className={`px-10 py-5 rounded-2xl font-black italic text-xl transition-all border-2 ${theme === 'dark' ? 'bg-white/5 border-white/10 text-white/80' : 'bg-white border-gray-200 text-gray-800 shadow-xl'}`}
-        >
-          PRACTICE MODE
-        </motion.button>
+          <Flame className="w-3.5 h-3.5 animate-pulse text-orange-400" />
+          <span>World's #1 Competitive Typing Circuit</span>
+        </motion.div>
+
+        <h1 className="text-5xl sm:text-6xl md:text-[6rem] lg:text-[7.5rem] font-black italic tracking-tighter leading-[0.85] mb-4 sm:mb-6 uppercase drop-shadow-2xl">
+          <span className="block text-white">Speed.</span>
+          <span className="block bg-gradient-to-r from-blue-400 via-blue-500 to-indigo-400 bg-clip-text text-transparent">Precision.</span>
+          <span className="block text-white">Glory.</span>
+        </h1>
+        
+        <p className={`text-sm sm:text-base md:text-lg font-bold mb-6 sm:mb-8 max-w-xl mx-auto leading-relaxed ${theme === 'dark' ? 'text-white/60' : 'text-gray-600'}`}>
+          Dominate the racetrack with millisecond accuracy. Race real opponents globally in zero-latency private rooms or challenge adaptive AI bots.
+        </p>
+        
+        <div className="flex flex-col sm:flex-row gap-4 justify-center w-full max-w-sm sm:max-w-md">
+          <motion.button 
+            whileHover={{ scale: 1.04, y: -2 }}
+            whileTap={{ scale: 0.96 }}
+            onClick={onStart}
+            className="bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-500 hover:to-blue-600 text-white px-8 py-3.5 rounded-xl font-black italic text-base flex items-center justify-center gap-2 transition-all shadow-[0_10px_25px_rgba(37,99,235,0.3)] border border-blue-400/30"
+          >
+            <span>ENTER THE TRACK</span>
+            <ChevronRight className="w-5 h-5" />
+          </motion.button>
+          <motion.button 
+            whileHover={{ scale: 1.04, backgroundColor: theme === 'dark' ? 'rgba(255,255,255,0.1)' : 'rgba(243,244,246,1)' }}
+            whileTap={{ scale: 0.96 }}
+            onClick={onPractice}
+            className={`px-8 py-3.5 rounded-xl font-black italic text-base transition-all border-2 ${theme === 'dark' ? 'bg-white/5 border-white/10 text-white/80' : 'bg-white border-gray-200 text-gray-800 shadow-xl'}`}
+          >
+            PRACTICE MODE
+          </motion.button>
+        </div>
+      </motion.div>
+
+      {/* Bounce scroll hint */}
+      <div className="relative z-20 flex flex-col items-center animate-bounce opacity-40">
+        <span className="text-[8px] font-black uppercase tracking-[0.2em] mb-1">Scroll to Explore</span>
+        <ChevronRight className="w-3.5 h-3.5 rotate-90 text-blue-500" />
       </div>
-    </motion.div>
+    </div>
 
     {/* Features Section */}
-    <div className="w-full max-w-6xl py-12 relative z-20">
+    <div className="w-full max-w-6xl py-16 px-6 relative z-20 border-t border-white/5 bg-black/10 backdrop-blur-sm shrink-0">
       <div className="text-center mb-10">
         <h2 className="text-xs font-black uppercase tracking-[0.3em] text-blue-400 mb-2">Engineered For Champions</h2>
         <h3 className="text-3xl md:text-4xl font-black italic uppercase tracking-tight">Built For Millisecond Competition</h3>
@@ -1355,7 +1444,7 @@ const LandingView = ({ onStart, onPractice, theme }: any) => (
     </div>
 
     {/* Testimonials Section */}
-    <div className="w-full max-w-6xl py-12 relative z-20">
+    <div className="w-full max-w-6xl py-16 px-6 relative z-20 shrink-0">
       <div className="text-center mb-10">
         <h2 className="text-xs font-black uppercase tracking-[0.3em] text-blue-400 mb-2">Community Reviews</h2>
         <h3 className="text-3xl md:text-4xl font-black italic uppercase tracking-tight">Loved By Competitive Typists</h3>
@@ -1384,7 +1473,7 @@ const LandingView = ({ onStart, onPractice, theme }: any) => (
     </div>
 
     {/* Call-To-Action Banner */}
-    <div className={`w-full max-w-5xl my-12 p-10 md:p-14 rounded-[3rem] border relative overflow-hidden text-center z-20 ${
+    <div className={`w-full max-w-5xl my-16 mx-6 p-10 md:p-14 rounded-[3rem] border relative overflow-hidden text-center z-20 shrink-0 ${
       theme === 'dark' ? 'bg-gradient-to-r from-blue-900/40 via-blue-900/20 to-purple-900/40 border-blue-500/30' : 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-2xl'
     }`}>
       <div className="relative z-10 max-w-2xl mx-auto">
@@ -1606,101 +1695,63 @@ const DashboardView = ({
   const nextLevelPoints = 250 * (user.level + 1) * user.level;
   const levelProgress = Math.min(100, Math.max(0, ((user.points - currentLevelPoints) / (nextLevelPoints - currentLevelPoints)) * 100));
 
-  const winRate = user.races_played > 0 ? Math.round(((user.wins || 0) / user.races_played) * 100) : 0;
-  const wpmProgress = Math.min(100, Math.round(((user.best_wpm || 0) / 150) * 100));
-  const accuracyProgress = Math.round(user.avg_accuracy || 100);
-
   return (
     <motion.div 
-      initial={{ opacity: 0, y: 20 }} 
+      initial={{ opacity: 0, y: 15 }} 
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.5, ease: [0.22, 1, 0.36, 1] }}
-      className="relative z-10 p-6 md:p-8 pt-10 max-w-7xl mx-auto"
+      transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
+      className="relative z-10 p-4 md:p-6 pt-4 max-w-7xl mx-auto space-y-6"
     >
-      {/* Profile Header & Top Control Bar */}
-      <div className={`p-8 md:p-10 rounded-[3rem] border mb-10 transition-all backdrop-blur-xl relative overflow-visible shadow-2xl ${
-        theme === 'dark' ? 'bg-white/5 border-white/10' : 'bg-white border-gray-100 shadow-xl'
+      {/* Sleek Horizontal Header / Navbar */}
+      <div className={`p-4 md:p-5 rounded-[2rem] border transition-all backdrop-blur-xl relative overflow-visible shadow-lg ${
+        theme === 'dark' ? 'bg-white/5 border-white/10' : 'bg-white border-gray-150 shadow-sm'
       }`}>
-        <div className="flex flex-col lg:flex-row items-center justify-between gap-8 relative z-10">
-          
-          {/* User Details */}
-          <div className="flex flex-col sm:flex-row items-center gap-6 text-center sm:text-left w-full lg:w-auto">
-            <div className="relative shrink-0">
-              <AvatarDisplay avatarId={user.avatar} size="lg" />
-              <div className="absolute -bottom-2 -right-2 bg-blue-500 text-white text-[10px] font-black px-2.5 py-1 rounded-xl uppercase tracking-wider border-2 border-neutral-900 shadow-md">
-                LVL {user.level}
-              </div>
+        <div className="flex flex-row items-center justify-between gap-4 relative z-10">
+          {/* Brand/App Title */}
+          <div className="flex items-center gap-2.5">
+            <div className="bg-blue-600/10 p-2 rounded-xl border border-blue-500/20 text-blue-500">
+              <Gamepad2 className="w-5 h-5 animate-pulse" />
             </div>
-
-            <div className="flex-1 min-w-0">
-              <div className="flex flex-wrap items-center justify-center sm:justify-start gap-3 mb-2">
-                <h2 className="text-3xl sm:text-4xl font-black italic tracking-tighter uppercase leading-none truncate max-w-xs md:max-w-md" title={user.username}>
-                  {user.username}
-                </h2>
-                <motion.div 
-                  animate={pointsAnimating ? { scale: [1, 1.2, 1] } : {}}
-                  className="inline-flex items-center gap-1.5 bg-yellow-500/10 border border-yellow-500/20 px-3 py-1 rounded-xl text-yellow-500 font-black text-xs shrink-0"
-                >
-                  <Coins className="w-4 h-4" />
-                  <span>{user.points || 0} POINTS</span>
-                </motion.div>
-              </div>
-
-              {/* Phone Number Display */}
-              <div className={`flex items-center justify-center sm:justify-start gap-2 text-xs font-bold mb-4 ${
-                theme === 'dark' ? 'text-white/40' : 'text-gray-500'
-              }`}>
-                <Phone className="w-3.5 h-3.5 text-blue-400" />
-                <span>{user.phoneNumber || user.phone_number || 'No phone linked'}</span>
-              </div>
-
-              {/* Animated Level XP Progress Bar */}
-              <div className="w-full max-w-md">
-                <div className="flex justify-between items-center text-[10px] font-black uppercase tracking-wider mb-1.5">
-                  <span className={theme === 'dark' ? 'text-white/40' : 'text-gray-400'}>Level Progress</span>
-                  <span className="text-blue-400">{Math.round(levelProgress)}% to LVL {user.level + 1}</span>
-                </div>
-                <div className="w-full h-2.5 bg-black/20 rounded-full overflow-hidden p-0.5 border border-white/5">
-                  <motion.div 
-                    initial={{ width: 0 }}
-                    animate={{ width: `${levelProgress}%` }}
-                    transition={{ duration: 1.2, ease: "easeOut" }}
-                    className="h-full bg-gradient-to-r from-blue-500 to-indigo-500 rounded-full shadow-[0_0_12px_rgba(59,130,246,0.6)]"
-                  />
-                </div>
-              </div>
+            <div>
+              <h1 className="text-xl font-black italic tracking-tighter uppercase leading-none">
+                TYPE RACER
+              </h1>
+              <span className={`text-[8px] font-bold tracking-widest uppercase ${theme === 'dark' ? 'text-white/30' : 'text-gray-400'}`}>
+                Dashboard
+              </span>
             </div>
           </div>
 
           {/* Action Bar */}
-          <div className="flex items-center gap-3 shrink-0">
+          <div className="flex items-center gap-2.5 shrink-0">
             <button 
               onClick={onShowGuide} 
-              className={`px-5 py-3.5 rounded-2xl border transition-all flex items-center gap-2 group ${
+              className={`px-3.5 py-2.5 rounded-xl border transition-all flex items-center gap-1.5 group ${
                 theme === 'dark' ? 'bg-white/5 border-white/10 hover:bg-white/10' : 'bg-white border-gray-200 hover:bg-gray-50 shadow-sm'
               }`}
             >
-              <BookOpen className="w-4 h-4 text-emerald-400 group-hover:scale-110 transition-transform" />
-              <span className="text-xs font-black italic uppercase tracking-wider">Guide</span>
+              <BookOpen className="w-3.5 h-3.5 text-emerald-400 group-hover:scale-110 transition-transform" />
+              <span className="text-[10px] font-black italic uppercase tracking-wider hidden sm:inline">Guide</span>
             </button>
             
-            <div className="relative">
+            {/* Settings dropdown wrapper with high relative z-index */}
+            <div className="relative z-[120]">
               <button 
                 onClick={() => setShowSettingsDropdown(!showSettingsDropdown)} 
-                className={`p-3.5 rounded-2xl border transition-all flex items-center gap-2 group ${
+                className={`p-2.5 rounded-xl border transition-all flex items-center justify-center group relative z-[130] ${
                   showSettingsDropdown 
                     ? (theme === 'dark' ? 'bg-white/15 border-white/20 text-blue-400' : 'bg-gray-100 border-gray-300 text-blue-600')
                     : (theme === 'dark' ? 'bg-white/5 border-white/10 hover:bg-white/10' : 'bg-white border-gray-200 hover:bg-gray-50 shadow-sm')
                 }`}
               >
-                <Settings className="w-5 h-5 group-hover:rotate-90 transition-transform" />
+                <Settings className="w-4 h-4 group-hover:rotate-90 transition-transform text-current" />
               </button>
               
               <AnimatePresence>
                 {showSettingsDropdown && (
                   <>
                     <div 
-                      className="fixed inset-0 z-40 cursor-default" 
+                      className="fixed inset-0 z-[110] cursor-default" 
                       onClick={() => setShowSettingsDropdown(false)} 
                     />
                     
@@ -1708,27 +1759,24 @@ const DashboardView = ({
                       initial={{ opacity: 0, scale: 0.95, y: 10 }}
                       animate={{ opacity: 1, scale: 1, y: 0 }}
                       exit={{ opacity: 0, scale: 0.95, y: 10 }}
-                      className={`absolute right-0 mt-3 w-[300px] max-w-[calc(100vw-2rem)] p-5 rounded-3xl border shadow-2xl z-50 text-left ${
+                      className={`absolute right-0 mt-2 w-[240px] max-w-[calc(100vw-2rem)] p-4 rounded-2xl border shadow-2xl z-[120] text-left origin-top-right ${
                         theme === 'dark' 
                           ? 'bg-neutral-950 border-white/10 text-white shadow-black/80' 
                           : 'bg-white border-gray-200 text-gray-900 shadow-gray-200'
                       }`}
                     >
-                      <h4 className="text-xs font-black uppercase tracking-widest text-blue-500 mb-3 px-1">Settings</h4>
+                      <h4 className="text-[10px] font-black uppercase tracking-widest text-blue-500 mb-2 px-1">Settings</h4>
                       
-                      <div className="space-y-1.5">
+                      <div className="space-y-1">
                         <button
                           onClick={() => {
                             setShowSettingsDropdown(false);
                             onChangeUsername();
                           }}
-                          className="w-full text-left px-4 py-3 rounded-2xl flex items-center gap-3 transition-all hover:bg-blue-500/10 text-blue-400 font-bold text-xs"
+                          className="w-full text-left px-3 py-2 rounded-xl flex items-center gap-2.5 transition-all hover:bg-blue-500/10 text-blue-400 font-bold text-xs"
                         >
-                          <User className="w-4 h-4 shrink-0" />
-                          <div className="flex flex-col">
-                            <span className="font-bold">EDIT PROFILE</span>
-                            <span className="text-[10px] text-blue-400/60 font-medium">Change avatar & username</span>
-                          </div>
+                          <User className="w-3.5 h-3.5 shrink-0" />
+                          <span className="font-bold">EDIT PROFILE</span>
                         </button>
 
                         <button
@@ -1736,13 +1784,10 @@ const DashboardView = ({
                             setShowSettingsDropdown(false);
                             onDeleteAccount();
                           }}
-                          className="w-full text-left px-4 py-3 rounded-2xl flex items-center gap-3 transition-all hover:bg-red-500/10 text-red-500 font-bold text-xs"
+                          className="w-full text-left px-3 py-2 rounded-xl flex items-center gap-2.5 transition-all hover:bg-red-500/10 text-red-500 font-bold text-xs"
                         >
-                          <Trash2 className="w-4 h-4 shrink-0" />
-                          <div className="flex flex-col">
-                            <span className="font-bold">DELETE ACCOUNT</span>
-                            <span className="text-[10px] text-red-400/60 font-medium">Permanently erase profile</span>
-                          </div>
+                          <Trash2 className="w-3.5 h-3.5 shrink-0" />
+                          <span className="font-bold">DELETE ACCOUNT</span>
                         </button>
                       </div>
                     </motion.div>
@@ -1753,175 +1798,239 @@ const DashboardView = ({
 
             <button 
               onClick={onLogout} 
-              className={`p-3.5 rounded-2xl border transition-all ${
+              className={`p-2.5 rounded-xl border transition-all ${
                 theme === 'dark' ? 'bg-red-500/10 text-red-500 border-red-500/20 hover:bg-red-500/20' : 'bg-red-50 text-red-600 border-red-100 hover:bg-red-100 shadow-sm'
               }`}
             >
-              <LogOut className="w-5 h-5" />
+              <LogOut className="w-4 h-4" />
             </button>
           </div>
         </div>
       </div>
 
-      {/* Stats Cards Section - Career Races Only */}
-      <div className="mb-12 max-w-sm">
-        <div className={`p-6 rounded-3xl border relative overflow-hidden transition-all ${
-          theme === 'dark' ? 'bg-white/5 border-white/10' : 'bg-white border-gray-200 shadow-lg'
-        }`}>
-          <div className="flex justify-between items-start mb-4">
-            <span className={`text-[10px] font-black uppercase tracking-widest ${theme === 'dark' ? 'text-white/40' : 'text-gray-400'}`}>Career Races</span>
-            <div className="w-8 h-8 rounded-xl bg-purple-500/20 flex items-center justify-center text-purple-400">
-              <Activity className="w-4 h-4" />
+      {/* Main Split Column Layout */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Left Column: Profile Card & Career Races */}
+        <div className="space-y-6 lg:col-span-1">
+          <div className={`p-6 rounded-[2rem] border transition-all backdrop-blur-xl flex flex-col items-center text-center shadow-md ${
+            theme === 'dark' ? 'bg-white/5 border-white/10' : 'bg-white border-gray-150'
+          }`}>
+            {/* User Avatar */}
+            <div className="relative shrink-0 mb-4">
+              <AvatarDisplay avatarId={user.avatar} size="lg" />
+              <div className="absolute -bottom-2 -right-2 bg-blue-500 text-white text-[10px] font-black px-2 py-0.5 rounded-lg uppercase tracking-wider border border-neutral-900 shadow-md">
+                LVL {user.level}
+              </div>
             </div>
-          </div>
-          <div className="text-4xl font-black italic tracking-tight mb-2 leading-none">
-            {user.races_played ?? user.matchesPlayed ?? user.racesPlayed ?? 0}
-          </div>
-          <p className={`text-[10px] font-bold ${theme === 'dark' ? 'text-white/30' : 'text-gray-400'}`}>Total Circuits Completed</p>
-        </div>
-      </div>
 
-      {/* Game Modes Circuit */}
-      <div className="space-y-8">
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-          <AnimatePresence mode="wait">
-            {multiplayerAction === 'none' ? (
-              <motion.div
-                key="multiplayer-default"
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 0.95 }}
-              >
-                <GameModeCard 
-                  title="MULTIPLAYER" 
-                  desc="Race real typists in zero-latency private rooms."
-                  icon={<Users className="w-8 h-8" />}
-                  color="bg-blue-600"
-                  onClick={() => setMultiplayerAction('select')}
+            {/* Profile Info */}
+            <div className="w-full space-y-1 mb-4">
+              <div className="flex items-center justify-center gap-2 flex-wrap">
+                <h2 className="text-2xl font-black italic tracking-tighter uppercase leading-none truncate max-w-[180px]" title={user.username}>
+                  {user.username}
+                </h2>
+                <motion.div 
+                  animate={pointsAnimating ? { scale: [1, 1.2, 1] } : {}}
+                  className="inline-flex items-center gap-1 bg-yellow-500/10 border border-yellow-500/20 px-2 py-0.5 rounded-lg text-yellow-500 font-black text-[9px] shrink-0"
+                >
+                  <Coins className="w-3 h-3" />
+                  <span>{user.points || 0} PTS</span>
+                </motion.div>
+              </div>
+
+              {/* Phone number */}
+              <div className={`flex items-center justify-center gap-1.5 text-[11px] font-bold ${
+                theme === 'dark' ? 'text-white/40' : 'text-gray-500'
+              }`}>
+                <Phone className="w-3 h-3 text-blue-400" />
+                <span>{user.phoneNumber || user.phone_number || 'No phone linked'}</span>
+              </div>
+            </div>
+
+            {/* Level XP Progress Bar */}
+            <div className="w-full space-y-1 border-t border-dashed border-white/10 pt-4">
+              <div className="flex justify-between items-center text-[9px] font-black uppercase tracking-wider mb-1">
+                <span className={theme === 'dark' ? 'text-white/40' : 'text-gray-400'}>XP Progress</span>
+                <span className="text-blue-400">{Math.round(levelProgress)}% to LVL {user.level + 1}</span>
+              </div>
+              <div className="w-full h-2 bg-black/20 rounded-full overflow-hidden p-0.5 border border-white/5">
+                <motion.div 
+                  initial={{ width: 0 }}
+                  animate={{ width: `${levelProgress}%` }}
+                  transition={{ duration: 1.2, ease: "easeOut" }}
+                  className="h-full bg-gradient-to-r from-blue-500 to-indigo-500 rounded-full shadow-[0_0_8px_rgba(59,130,246,0.5)]"
                 />
-              </motion.div>
-            ) : multiplayerAction === 'select' ? (
-              <motion.div 
-                key="multiplayer-select"
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 0.95 }}
-                className="bg-blue-600 rounded-[2.5rem] p-10 flex flex-col justify-center gap-4 relative overflow-hidden shadow-2xl border border-blue-400/20"
-              >
-                <button 
-                  onClick={() => setMultiplayerAction('join')}
-                  className="w-full bg-white/10 hover:bg-white/20 py-5 rounded-2xl font-black italic tracking-tighter flex items-center justify-center gap-3 transition-all transform hover:scale-[1.02] active:scale-95"
-                >
-                  <Users className="w-6 h-6" /> ENTER CODE
-                </button>
-                <button 
-                  onClick={() => { onCreateRoom(); setMultiplayerAction('none'); }}
-                  className="w-full bg-white text-blue-600 py-5 rounded-2xl font-black italic tracking-tighter flex items-center justify-center gap-3 transition-all shadow-2xl transform hover:scale-[1.02] active:scale-95"
-                >
-                  <UserPlus className="w-6 h-6" /> INVITE FRIENDS
-                </button>
-                <button 
-                  onClick={() => setMultiplayerAction('none')}
-                  className="text-xs font-black tracking-widest text-white/50 hover:text-white uppercase mt-4 text-center transition-colors"
-                >
-                  CANCEL
-                </button>
-              </motion.div>
-            ) : (
-              <motion.div 
-                key="multiplayer-join"
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 0.95 }}
-                className="bg-blue-600 rounded-[2.5rem] p-10 flex flex-col justify-center gap-4 relative overflow-hidden shadow-2xl border border-blue-400/20"
-              >
-                <div className="relative">
-                  <input 
-                    autoFocus
-                    placeholder="ENTER ROOM CODE"
-                    value={roomCodeInput}
-                    onChange={(e) => setRoomCodeInput(e.target.value.toUpperCase())}
-                    className="w-full bg-black/30 border-2 border-white/10 rounded-2xl py-5 px-8 text-white font-black italic text-xl placeholder:text-white/20 focus:outline-none focus:border-white/30 transition-all text-center tracking-widest"
-                  />
-                </div>
-                <button 
-                  onClick={() => { onJoinRoom(roomCodeInput); setMultiplayerAction('none'); setRoomCodeInput(''); }}
-                  className="w-full bg-white text-blue-600 py-5 rounded-2xl font-black italic tracking-tighter flex items-center justify-center gap-3 transition-all shadow-2xl transform hover:scale-[1.02] active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
-                  disabled={!roomCodeInput}
-                >
-                  JOIN ROOM
-                </button>
-                <button 
-                  onClick={() => setMultiplayerAction('select')}
-                  className="text-xs font-black tracking-widest text-white/50 hover:text-white uppercase mt-4 text-center transition-colors"
-                >
-                  BACK
-                </button>
-              </motion.div>
-            )}
-          </AnimatePresence>
-
-          <motion.div 
-            whileHover={{ scale: 1.02, rotate: -0.5 }}
-            className={`p-10 rounded-[2.5rem] transition-all shadow-2xl relative overflow-hidden flex flex-col justify-between group ${theme === 'dark' ? 'bg-orange-600' : 'bg-orange-500 text-white'}`}
-          >
-            <div className="relative z-10">
-              <div className="mb-6 bg-white/20 w-16 h-16 rounded-[1.25rem] flex items-center justify-center group-hover:rotate-12 transition-transform shadow-lg">
-                <Zap className="w-8 h-8" />
-              </div>
-              <h3 className="text-4xl font-black italic tracking-tighter mb-2">PRACTICE</h3>
-              <p className="text-white/70 text-sm mb-8 font-bold">Refine your speed with a solo target challenge.</p>
-              
-              <div className="grid grid-cols-3 sm:grid-cols-6 gap-3">
-                {[10, 20, 30, 40, 50, 60].map(wpm => (
-                  <motion.button 
-                    key={wpm}
-                    whileHover={{ scale: 1.1, y: -2 }}
-                    whileTap={{ scale: 0.9 }}
-                    onClick={() => onPracticeMode(wpm)}
-                    className="bg-white/20 hover:bg-white/40 py-3 rounded-xl font-black italic text-sm transition-all border border-white/10"
-                  >
-                    {wpm}
-                  </motion.button>
-                ))}
               </div>
             </div>
-            <div className="absolute top-0 right-0 w-48 h-48 bg-white/5 blur-3xl rounded-full -mr-24 -mt-24 pointer-events-none" />
+          </div>
+
+          {/* Career Races Stats Card */}
+          <div className={`p-6 rounded-[2rem] border transition-all text-center flex flex-col justify-center relative overflow-hidden shadow-md ${
+            theme === 'dark' ? 'bg-gradient-to-br from-neutral-900 to-neutral-950 border-white/10' : 'bg-white border-gray-150'
+          }`}>
+            <div className="absolute top-0 right-0 w-32 h-32 bg-purple-500/5 blur-2xl rounded-full -mr-16 -mt-16 pointer-events-none" />
+            <div className="flex justify-center mb-2.5">
+              <div className="bg-purple-500/10 p-3 rounded-2xl border border-purple-500/20 text-purple-500">
+                <Trophy className="w-6 h-6" />
+              </div>
+            </div>
+            <div className={`text-[10px] font-black uppercase tracking-widest ${theme === 'dark' ? 'text-white/40' : 'text-gray-400'} mb-1`}>
+              Career Races Played
+            </div>
+            <div className="text-4xl font-black italic tracking-tight text-purple-500 leading-none">
+              {user.races_played ?? user.matchesPlayed ?? user.racesPlayed ?? 0}
+            </div>
+            <p className={`text-[10px] font-bold mt-2 leading-relaxed px-4 ${theme === 'dark' ? 'text-white/30' : 'text-gray-400'}`}>
+              Completed challenges against bots and real players worldwide.
+            </p>
+          </div>
+        </div>
+
+        {/* Right Columns: Game Modes & Challenges */}
+        <div className="space-y-6 lg:col-span-2">
+          {/* Game Modes Row */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <AnimatePresence mode="wait">
+              {multiplayerAction === 'none' ? (
+                <motion.div
+                  key="multiplayer-default"
+                  initial={{ opacity: 0, scale: 0.98 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.98 }}
+                >
+                  <GameModeCard 
+                    title="MULTIPLAYER" 
+                    desc="Race real typists in zero-latency private rooms."
+                    icon={<Users className="w-6 h-6" />}
+                    color="bg-blue-600"
+                    onClick={() => setMultiplayerAction('select')}
+                  />
+                </motion.div>
+              ) : multiplayerAction === 'select' ? (
+                <motion.div 
+                  key="multiplayer-select"
+                  initial={{ opacity: 0, scale: 0.98 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.98 }}
+                  className="bg-blue-600 rounded-[2rem] p-6 md:p-8 flex flex-col justify-center gap-3 relative overflow-hidden shadow-xl border border-blue-400/20 min-h-[200px]"
+                >
+                  <button 
+                    onClick={() => setMultiplayerAction('join')}
+                    className="w-full bg-white/10 hover:bg-white/20 py-4 rounded-xl font-black italic tracking-tighter flex items-center justify-center gap-2.5 transition-all transform hover:scale-[1.01]"
+                  >
+                    <Users className="w-5 h-5" /> ENTER CODE
+                  </button>
+                  <button 
+                    onClick={() => { onCreateRoom(); setMultiplayerAction('none'); }}
+                    className="w-full bg-white text-blue-600 py-4 rounded-xl font-black italic tracking-tighter flex items-center justify-center gap-2.5 transition-all shadow-md transform hover:scale-[1.01]"
+                  >
+                    <UserPlus className="w-5 h-5" /> INVITE FRIENDS
+                  </button>
+                  <button 
+                    onClick={() => setMultiplayerAction('none')}
+                    className="text-xs font-black tracking-widest text-white/50 hover:text-white uppercase mt-2 text-center transition-colors"
+                  >
+                    CANCEL
+                  </button>
+                </motion.div>
+              ) : (
+                <motion.div 
+                  key="multiplayer-join"
+                  initial={{ opacity: 0, scale: 0.98 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.98 }}
+                  className="bg-blue-600 rounded-[2rem] p-6 md:p-8 flex flex-col justify-center gap-3 relative overflow-hidden shadow-xl border border-blue-400/20 min-h-[200px]"
+                >
+                  <div className="relative">
+                    <input 
+                      autoFocus
+                      placeholder="ENTER ROOM CODE"
+                      value={roomCodeInput}
+                      onChange={(e) => setRoomCodeInput(e.target.value.toUpperCase())}
+                      className="w-full bg-black/30 border-2 border-white/10 rounded-xl py-4 px-6 text-white font-black italic text-lg placeholder:text-white/20 focus:outline-none focus:border-white/30 transition-all text-center tracking-widest"
+                    />
+                  </div>
+                  <button 
+                    onClick={() => { onJoinRoom(roomCodeInput); setMultiplayerAction('none'); setRoomCodeInput(''); }}
+                    className="w-full bg-white text-blue-600 py-4 rounded-xl font-black italic tracking-tighter flex items-center justify-center gap-2.5 transition-all shadow-md transform hover:scale-[1.01] disabled:opacity-50 disabled:cursor-not-allowed"
+                    disabled={!roomCodeInput}
+                  >
+                    JOIN ROOM
+                  </button>
+                  <button 
+                    onClick={() => setMultiplayerAction('select')}
+                    className="text-xs font-black tracking-widest text-white/50 hover:text-white uppercase mt-2 text-center transition-colors"
+                  >
+                    BACK
+                  </button>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            <motion.div 
+              whileHover={{ scale: 1.01, rotate: -0.2 }}
+              className={`p-6 md:p-8 rounded-[2rem] transition-all shadow-xl relative overflow-hidden flex flex-col justify-between group ${theme === 'dark' ? 'bg-orange-600' : 'bg-orange-500 text-white'} min-h-[200px]`}
+            >
+              <div className="relative z-10 w-full">
+                <div className="flex items-center justify-between mb-4">
+                  <div className="bg-white/20 w-10 h-10 rounded-xl flex items-center justify-center group-hover:rotate-12 transition-transform shadow-md">
+                    <Zap className="w-5 h-5" />
+                  </div>
+                  <h3 className="text-2xl font-black italic tracking-tighter">PRACTICE</h3>
+                </div>
+                <p className="text-white/80 text-xs mb-4 font-bold uppercase tracking-wide">Refine your speed with a solo target challenge.</p>
+                
+                <div className="grid grid-cols-3 sm:grid-cols-6 gap-2 w-full">
+                  {[10, 20, 30, 40, 50, 60].map(wpm => (
+                    <motion.button 
+                      key={wpm}
+                      whileHover={{ scale: 1.08, y: -1 }}
+                      whileTap={{ scale: 0.95 }}
+                      onClick={() => onPracticeMode(wpm)}
+                      className="bg-white/20 hover:bg-white/35 py-2.5 rounded-lg font-black italic text-xs transition-all border border-white/10 text-white"
+                    >
+                      {wpm}
+                    </motion.button>
+                  ))}
+                </div>
+              </div>
+              <div className="absolute top-0 right-0 w-32 h-32 bg-white/5 blur-2xl rounded-full -mr-16 -mt-16 pointer-events-none" />
+            </motion.div>
+          </div>
+
+          {/* AI Bot Challenges */}
+          <motion.div 
+            initial={{ opacity: 0, y: 15 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.1 }}
+            className={`border rounded-[2rem] p-5 md:p-6 ${theme === 'dark' ? 'bg-white/5 border-white/10' : 'bg-white border-gray-150 shadow-sm'}`}
+          >
+            <div className="flex justify-between items-center mb-6">
+              <h3 className="text-xl font-black italic tracking-tighter uppercase leading-none">Bot Race Challenges</h3>
+              <div className={`p-2 rounded-lg ${theme === 'dark' ? 'bg-white/5' : 'bg-gray-50'}`}>
+                <Gamepad2 className={`w-5 h-5 ${theme === 'dark' ? 'text-blue-400' : 'text-blue-600'}`} />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+              {Object.entries(BOT_DIFFICULTIES).map(([wpm, diff], idx) => (
+                <motion.button 
+                  key={wpm}
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  transition={{ delay: 0.2 + (idx * 0.04) }}
+                  whileHover={{ y: -3, scale: 1.02 }}
+                  whileTap={{ scale: 0.97 }}
+                  onClick={() => onBotSelect(Number(wpm))}
+                  className={`border rounded-2xl p-4 transition-all group relative overflow-hidden flex flex-col items-center justify-center ${theme === 'dark' ? 'bg-white/5 hover:bg-blue-600 border-white/5 hover:border-blue-500' : 'bg-gray-50 hover:bg-blue-600 border-gray-200 hover:border-blue-500 text-gray-900 hover:text-white shadow-md'}`}
+                >
+                  <div className="text-2xl font-black italic group-hover:scale-105 transition-transform mb-0.5 leading-none">{wpm}</div>
+                  <div className={`text-[9px] font-black uppercase tracking-widest transition-colors ${theme === 'dark' ? 'text-white/30 group-hover:text-blue-100' : 'text-gray-400 group-hover:text-blue-100'}`}>{diff.name}</div>
+                  <div className="absolute top-0 right-0 w-12 h-12 bg-white/5 blur-lg rounded-full -mr-6 -mt-6 pointer-events-none" />
+                </motion.button>
+              ))}
+            </div>
           </motion.div>
         </div>
-
-        {/* AI Bot Challenges */}
-        <motion.div 
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ delay: 0.2 }}
-          className={`border rounded-[3rem] p-10 ${theme === 'dark' ? 'bg-white/5 border-white/10' : 'bg-white border-gray-100 shadow-2xl'}`}
-        >
-          <div className="flex justify-between items-center mb-10">
-            <h3 className="text-3xl font-black italic tracking-tighter uppercase leading-none">Bot Race Challenges</h3>
-            <div className={`p-3 rounded-xl ${theme === 'dark' ? 'bg-white/5' : 'bg-gray-50'}`}>
-              <Gamepad2 className={theme === 'dark' ? 'text-blue-400' : 'text-blue-600'} />
-            </div>
-          </div>
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
-            {Object.entries(BOT_DIFFICULTIES).map(([wpm, diff], idx) => (
-              <motion.button 
-                key={wpm}
-                initial={{ opacity: 0, scale: 0.9 }}
-                animate={{ opacity: 1, scale: 1 }}
-                transition={{ delay: 0.3 + (idx * 0.05) }}
-                whileHover={{ y: -5, scale: 1.05 }}
-                whileTap={{ scale: 0.95 }}
-                onClick={() => onBotSelect(Number(wpm))}
-                className={`border rounded-[2rem] p-6 transition-all group relative overflow-hidden flex flex-col items-center justify-center ${theme === 'dark' ? 'bg-white/5 hover:bg-blue-600 border-white/5 hover:border-blue-500' : 'bg-gray-50 hover:bg-blue-600 border-gray-200 hover:border-blue-500 text-gray-900 hover:text-white shadow-lg'}`}
-              >
-                <div className="text-3xl font-black italic group-hover:scale-110 transition-transform mb-1 leading-none">{wpm}</div>
-                <div className={`text-[10px] font-black uppercase tracking-widest transition-colors ${theme === 'dark' ? 'text-white/30 group-hover:text-blue-100' : 'text-gray-400 group-hover:text-blue-100'}`}>{diff.name}</div>
-                <div className="absolute top-0 right-0 w-16 h-16 bg-white/5 blur-xl rounded-full -mr-8 -mt-8 pointer-events-none" />
-              </motion.button>
-            ))}
-          </div>
-        </motion.div>
       </div>
     </motion.div>
   );

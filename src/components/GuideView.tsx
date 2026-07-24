@@ -1,6 +1,8 @@
 import React from 'react';
 import { motion } from 'motion/react';
 import { BookOpen, MousePointer2, Keyboard, Lightbulb, CheckCircle2 } from 'lucide-react';
+// @ts-ignore
+import handPlacementGuideImg from '../assets/images/typing_hand_placement_guide_1784542473660.jpg';
 
 interface GuideViewProps {
   onBack: () => void;
@@ -52,7 +54,7 @@ const GuideView: React.FC<GuideViewProps> = ({ onBack, theme = 'dark' }) => {
             </h3>
             <div className="relative aspect-video rounded-3xl overflow-hidden bg-white group">
               <img 
-                src="/src/assets/images/typing_hand_placement_guide_1784542473660.jpg" 
+                src={handPlacementGuideImg} 
                 alt="Typing Hand Placement Guide"
                 className="w-full h-full object-contain"
                 referrerPolicy="no-referrer"
